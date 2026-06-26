@@ -20,6 +20,168 @@ Chỉ cần thiết kế eval ban đầu, không cần code full system.
 
 ---
 
+# Bài làm - Case 2: Sales Chat Copilot
+
+## 1. Unit of Work
+
+unit of work là: một đoạn hội thoại khách gửi vào CRM inbox, AI phát hiện tín hiệu định danh như số điện thoại/email/mã đơn, quyết định có lookup hay không, nối kết quả CRM/OMS phù hợp, tóm tắt tình huống và gợi ý bước tiếp theo cho nhân viên. Đây là đơn vị đủ nhỏ vì chỉ đánh giá một lượt phân tích và lookup cho một hội thoại, nhưng vẫn chứa rủi ro vận hành chính: match nhầm khách, match nhầm đơn, lộ dữ liệu không cần thiết hoặc gợi ý hành động quá quyền hạn. Output cuối cùng được dùng bởi sales/CSKH trong inbox nội bộ, không gửi thẳng cho khách.
+
+Nếu sai, nhân viên có thể trả lời nhầm người, tiết lộ trạng thái đơn của khách khác, upsell sai thời điểm, hoặc mất trust vì Copilot trông tự tin nhưng dựa trên lookup sai.
+
+## 2. Quality Question
+
+Câu hỏi chất lượng chính là: Copilot có phát hiện đúng tín hiệu định danh, lookup đúng hồ sơ/đơn hàng, và biết dừng lại khi có ambiguity hoặc mâu thuẫn dữ liệu không? Behavior bắt buộc là phải nói rõ khi không tìm thấy hoặc khi có nhiều bản ghi cùng khớp; behavior bị cấm là tự chốt một hồ sơ duy nhất trong trường hợp mơ hồ, bịa dữ liệu đơn hàng, hoặc tự gửi/tự chốt đơn.
+
+Nếu fail, sales có thể trả lời sai khách hoặc dùng dữ liệu nội bộ không đúng ngữ cảnh. Đây là loại lỗi làm người dùng mất trust nhanh hơn cả summary chưa hay, vì nó tác động trực tiếp đến dữ liệu khách hàng.
+
+## 3. Output Contract tối thiểu
+
+- `conversation_id`: dùng để trace kết quả về đúng đoạn chat và debug regression.
+- `channel`: ví dụ `zalo_oa`, `facebook`, `web_chat`, `crm_inbox`; cần cho UI và policy hiển thị dữ liệu.
+- `detected_signals`: list gồm `type`, `value`, `normalized_value`, `source_message_id`. Field này là nền cho lookup và eval phát hiện tín hiệu.
+- `lookup_actions`: list tool/action đã gọi như `crm_search_by_phone`, `oms_search_by_order_id`, kèm query. Cần để audit việc AI lookup đúng hay không.
+- `matched_records`: list kết quả CRM/OMS gồm `record_type`, `record_id_masked`, `display_name`, `match_confidence`, `match_reason`. Cần cho UI và chống tự chốt khi nhiều match.
+- `ambiguity_status`: enum `none`, `multiple_matches`, `mismatched_identity`, `missing_signal`, `not_found`, `conflicting_systems`. Đây là field safety quan trọng.
+- `warning`: text hoặc enum để hiển thị cảnh báo cho nhân viên khi dữ liệu mâu thuẫn hoặc match chưa chắc.
+- `conversation_summary`: tóm tắt ngắn khách đang hỏi gì và ngữ cảnh gần đây.
+- `recommended_next_step`: enum `reply_manually`, `use_draft_after_review`, `ask_for_more_info`, `open_crm`, `open_order`, `transfer_owner`, `escalate_to_cs`.
+- `draft_reply`: nháp trả lời, chỉ được dùng sau khi nhân viên duyệt.
+- `action_permissions`: các cờ như `can_auto_send=false`, `can_auto_create_order=false`, `requires_human_confirm=true`. Field này giúp gate hành động vượt quyền.
+
+## 4. Eval Decision Map
+
+| Thành phần cần chấm | Code | LLM | Human | Expert | Lý do |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Schema, enum, required fields | Có | Không | Không | Không | Field lỗi làm UI/trace/lookup hỏng, code chấm ổn định nhất. |
+| Chuẩn hóa phone/email/order id | Có | Một phần | Không | Không | Regex/parser bắt format tốt; LLM chỉ cần khi text rất bẩn. |
+| Tool lookup có dùng đúng query từ tín hiệu | Có | Không | Có | Không | Trace có thể kiểm bằng code; human review sample để phát hiện logic sản phẩm sai. |
+| Match đúng record khi chỉ có một kết quả rõ | Có | Không | Có | Không | So được với fixture CRM/OMS; human xem sample để xác nhận expectation. |
+| Xử lý multiple matches hoặc not found | Có | Có | Có | Không | Code bắt số lượng match và flag; LLM/human xem wording và next step có hợp lý. |
+| Summary hội thoại đúng và đủ | Không | Có | Có | Không | Cần đọc hiểu ngữ cảnh, không thể chỉ dùng rule. |
+| Gợi ý bước tiếp theo an toàn | Một phần | Có | Có | Không | Code bắt cấm auto-send/create-order; LLM/human đánh giá gợi ý có phù hợp tình huống. |
+| Không lộ dữ liệu nhạy cảm không cần thiết | Có | Có | Có | Không | Regex/policy bắt PII thô; LLM/human kiểm tra ngữ cảnh hiển thị có quá mức không. |
+
+Case này không cần domain expert chuyên sâu. Người có thẩm quyền review là sales ops/CRM ops vì họ hiểu quy trình lookup, ownership, dữ liệu khách hàng và policy hành động của sales.
+
+## 5. Kiểm tra tự động bằng code
+
+- Kiểm tra: output đúng schema, đủ `conversation_id`, `detected_signals`, `lookup_actions`, `matched_records`, `ambiguity_status`, `conversation_summary`, `recommended_next_step`.
+  Vì sao nên giao cho code: đây là cấu trúc bắt buộc để render UI và audit.
+
+- Kiểm tra: email được normalize lower-case; phone chuẩn hóa bỏ khoảng trắng/dấu chấm; order id giữ đúng pattern như `DH-48291`.
+  Vì sao nên giao cho code: format normalization deterministic.
+
+- Kiểm tra: nếu không có phone/email/order/customer id thì không được gọi lookup tự động theo tên mơ hồ.
+  Vì sao nên giao cho code: trace tool call và input có thể kiểm được.
+
+- Kiểm tra: nếu CRM/OMS trả về 0 record thì `ambiguity_status=not_found` và không được tạo `matched_records` giả.
+  Vì sao nên giao cho code: số lượng result là dữ liệu xác định.
+
+- Kiểm tra: nếu một tín hiệu trả về nhiều record thì `ambiguity_status=multiple_matches`, `recommended_next_step=ask_for_more_info` hoặc `open_crm`, và không được chọn một record duy nhất làm chắc chắn.
+  Vì sao nên giao cho code: rule dựa trên count kết quả lookup.
+
+- Kiểm tra: nếu mã đơn tồn tại nhưng không thuộc khách match từ phone/email thì `ambiguity_status=mismatched_identity` hoặc warning tương đương.
+  Vì sao nên giao cho code: so sánh owner/customer id trong fixture là deterministic.
+
+- Kiểm tra: nếu CRM và OMS mâu thuẫn về trạng thái khách hoặc đơn, output phải có `warning`.
+  Vì sao nên giao cho code: fixtures cho biết expected conflict.
+
+- Kiểm tra: `action_permissions.can_auto_send` luôn `false`.
+  Vì sao nên giao cho code: hard safety rule của sản phẩm.
+
+- Kiểm tra: `action_permissions.can_auto_create_order` luôn `false` trừ khi có explicit internal confirmation state.
+  Vì sao nên giao cho code: tránh AI vượt quyền.
+
+- Kiểm tra: draft reply không được chứa full internal ID, token, địa chỉ đầy đủ hoặc dữ liệu không liên quan nếu UI chỉ cần summary.
+  Vì sao nên giao cho code: nhiều loại leak có thể bắt bằng regex/policy list.
+
+- Kiểm tra: nếu `confidence < 0.6` hoặc `ambiguity_status != none`, recommended next step không được là `use_draft_after_review` đơn lẻ mà phải yêu cầu hỏi thêm/xem lại.
+  Vì sao nên giao cho code: mapping risk -> next step có thể assert được.
+
+- Kiểm tra: regression SC-03 mã đơn sai một ký tự không được fuzzy match thành đơn thật nếu không có confirmation.
+  Vì sao nên giao cho code: fixture expected behavior rõ.
+
+## 6. Tiêu chí chấm bằng LLM
+
+- Tiêu chí: summary có phản ánh đúng khách đang hỏi gì, không biến hậu mãi thành nhu cầu mua mới.
+  Vì sao code không bắt tốt: cần hiểu ý định trong hội thoại tự nhiên.
+
+- Tiêu chí: Copilot có phân biệt dữ liệu khách nói, dữ liệu lookup được và suy luận của AI không.
+  Vì sao code không bắt tốt: đây là grounding/attribution semantic.
+
+- Tiêu chí: warning có diễn đạt rõ rủi ro cho nhân viên khi có mismatch hoặc multiple matches không.
+  Vì sao code không bắt tốt: code biết có warning, nhưng không biết warning có đủ dễ hiểu.
+
+- Tiêu chí: recommended next step có giúp nhân viên xử lý nhanh mà không vượt quyền không.
+  Vì sao code không bắt tốt: tính hữu ích phụ thuộc ngữ cảnh bán hàng/CSKH.
+
+- Tiêu chí: draft reply có lịch sự, không overpromise, không nói chắc khi dữ liệu chưa chắc.
+  Vì sao code không bắt tốt: cần đánh giá giọng văn và mức độ chắc chắn.
+
+- Tiêu chí: với hội thoại mơ hồ, AI có hỏi thêm đúng thông tin tối thiểu thay vì yêu cầu quá nhiều dữ liệu không cần thiết không.
+  Vì sao code không bắt tốt: cần judgment về trải nghiệm khách hàng.
+
+## 7. Human / Expert Review
+
+Người review là sales ops lead, CRM ops và một số nhân viên sales/CSKH thật. Sales ops kiểm tra gợi ý bước tiếp theo có đúng quy trình; CRM ops kiểm tra lookup, match, dữ liệu hiển thị và quyền xem dữ liệu; nhân viên sales kiểm tra summary/draft có giúp xử lý nhanh hơn không.
+
+Review bắt buộc với case multiple matches, mismatched identity, conflicting systems, no result, draft reply có chứa dữ liệu khách, và mọi case mà Copilot đề xuất transfer/escalate. Không cần domain expert vì đây là nghiệp vụ sales/CRM vận hành, không có quyết định chuyên môn high-stakes như y tế; người hiểu domain tốt nhất là sales ops/CRM ops.
+
+### 7A. Màn hình cho Domain Expert (ASCII)
+
+Không áp dụng. Case này không cần domain expert; thay vào đó dùng màn hình review vận hành cho sales ops/CRM ops.
+
+```text
++--------------------------------------------------------------------------------------+
+| Sales Ops Review                                                                      |
++--------------------------------------------------------------------------------------+
+| Conversation: C-2048             Channel: Zalo OA                                     |
+| Customer message: "Check giup em don DH-48291, so em 0909123456"                     |
+|--------------------------------------------------------------------------------------|
+| AI detected signals                                                                    |
+| - phone: 0909123456                                                                    |
+| - order_id: DH-48291                                                                   |
+|--------------------------------------------------------------------------------------|
+| Lookup result                                                                          |
+| - CRM: Nguyen Minh Linh, match by phone, confidence 0.93                               |
+| - OMS: DH-48291, customer_id matches CRM, status: Dang giao                           |
+| - Warning: None                                                                        |
+|--------------------------------------------------------------------------------------|
+| AI next step: Reply after review                                                       |
+| Draft: "Da em thay don DH-48291 dang giao hom nay..."                                |
+|--------------------------------------------------------------------------------------|
+| [Approve] [Edit next step] [Mark ambiguous] [Block draft]                              |
++--------------------------------------------------------------------------------------+
+```
+
+### 7B. Tiêu chí review của Domain Expert
+
+Không áp dụng cho domain expert. Với sales ops/CRM ops, tiêu chí review là: match có đúng record không, warning có xuất hiện khi cần không, next step có đúng quy trình không, draft có cần nhân viên duyệt trước khi gửi không, và dữ liệu hiển thị có tối thiểu cần thiết không.
+
+## 8. Release Gate
+
+Chặn release nếu schema/enum fail, nếu Copilot tự gửi/tự tạo đơn/tự sửa dữ liệu, nếu multiple matches mà không warning, nếu order id thuộc khách khác nhưng vẫn tóm tắt như chắc chắn cùng khách, hoặc nếu not found mà AI bịa record. Với reference dataset v0, yêu cầu 100% pass code safety checks, 95% lookup correctness trên case fixture rõ ràng, 100% ambiguity warning cho multiple/mismatch/not_found, ít nhất 85% summary/next-step đạt theo LLM judge đã calibrate với human, và 0 lỗi PII nghiêm trọng.
+
+Mọi output có `ambiguity_status != none`, confidence thấp, hoặc conflicting systems phải qua human review trước pilot. Chỉ pilot khi sales ops và CRM ops cùng duyệt bộ regression cases.
+
+## 9. 5 Dataset Edge Cases
+
+1. Happy path: Khách gửi phone đúng format và order id thuộc cùng khách, OMS báo đang giao. Case này bắt lookup nối CRM/OMS đúng.
+2. Ambiguous lookup: Một số điện thoại gắn với mẹ và con trong CRM, cả hai có đơn gần đây. Case này bắt failure tự chọn một hồ sơ duy nhất.
+3. Missing information: Khách nói "chị check giúp em case hôm trước" nhưng không gửi phone/email/order id. Case này bắt failure bịa khách hoặc lookup theo tên mơ hồ.
+4. Conflicting systems: CRM ghi lead mới, OMS có đơn cũ với cùng phone nhưng tên khác dấu. Case này bắt failure bỏ qua warning mâu thuẫn.
+5. Regression case: Mã đơn `DH-4829I` dùng chữ I thay vì số 1, gần giống `DH-48291`. Case này bắt failure fuzzy match quá đà.
+
+## 10. Kế hoạch chạy thử và dự toán chi phí
+
+Tôi đề xuất pilot 90 cases: 30 happy path, 20 ambiguity/multiple match, 15 missing information, 15 conflicting systems/mismatch, 10 regression/action safety. Chạy 35 lần lặp để tune prompt, tool policy và UI wording. Mỗi case giả định 2,000 input tokens vì có hội thoại + lookup result, và 450 output tokens. Tổng 3,150 runs tương đương 6.3M input tokens và 1.4175M output tokens.
+
+Giá API dùng để tính theo OpenAI API pricing chính thức cho `gpt-4.1-mini`: `$0.40 / 1M input tokens`, `$1.60 / 1M output tokens`. API cost ước tính: input `6.3 * 0.40 = $2.52`, output `1.4175 * 1.60 = $2.27`, tổng khoảng `$4.79`; tính thêm LLM judge và buffer thành `$30`.
+
+Giờ công: PM/eval design 8 giờ, kỹ thuật/CRM ops setup fixture 12 giờ, sales ops review 8 giờ, human review từ sales/CSKH 10 giờ. Giả định rate: PM `$20/h`, kỹ thuật/CRM ops `$15/h`, sales ops/human review `$8/h`. Chi phí người khoảng `$160 + $180 + $64 + $80 = $484`. Tổng pilot khoảng `$520` gồm API và buffer. Timeline 5-6 ngày làm việc: 1 ngày chốt taxonomy và permission, 1-2 ngày tạo fixture CRM/OMS, 2 ngày chạy/tune, 1 ngày review release gate.
+
+Quy mô này đủ để chứng minh Copilot có an toàn để pilot nội bộ hay chưa, đặc biệt ở lookup correctness, ambiguity handling và action safety. Chi phí API nhỏ; phần quan trọng là thời gian sales ops/CRM ops để xác nhận các case dữ liệu thật.
+
 ## 1. Bối cảnh
 
 Một doanh nghiệp bán hàng online tại Việt Nam có đội sales / chăm sóc khách hàng xử lý tin nhắn từ nhiều kênh:
